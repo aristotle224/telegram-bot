@@ -4,7 +4,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { access, link, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { access, link, mkdir, readFile, realpath, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { pathToFileURL } from "node:url";
@@ -65,6 +65,7 @@ async function writeAtomic(filePath: string, contents: string, replace: boolean)
 
 /** Copy a validated supported cursor snapshot without exposing cursor values. */
 export async function backupCursor(options: BackupCursorOptions): Promise<void> {
+  await assertDifferentPaths(options.cursorFile, options.backupFile);
   const raw = await readFile(options.cursorFile, "utf8");
   const parsed = validateCursor(raw);
   if (!options.force && (await exists(options.backupFile))) {
@@ -79,6 +80,7 @@ export async function backupCursor(options: BackupCursorOptions): Promise<void> 
 
 /** Restore a compatible cursor while holding the poller's exclusive lock. */
 export async function restoreCursor(options: RestoreCursorOptions): Promise<void> {
+  await assertDifferentPaths(options.cursorFile, options.backupFile);
   const lock = await acquireInstanceLock(options.lockFile);
   try {
     const raw = await readFile(options.backupFile, "utf8");
@@ -134,10 +136,46 @@ function resolvePath(value: string): string {
   return path.resolve(process.cwd(), value);
 }
 
-function assertDifferentPaths(left: string, right: string): void {
-  const normalize = (value: string) =>
-    process.platform === "win32" ? path.resolve(value).toLowerCase() : path.resolve(value);
-  if (normalize(left) === normalize(right)) {
+async function canonicalizePath(filePath: string): Promise<string> {
+  const resolved = path.resolve(filePath);
+  const normalizeCase = (value: string) =>
+    process.platform === "win32" ? value.toLowerCase() : value;
+
+  try {
+    return normalizeCase(await realpath(resolved));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw err;
+    }
+  }
+
+  // If the leaf does not exist yet, resolve symlinks on the nearest existing ancestor.
+  const segments: string[] = [];
+  let current = resolved;
+  for (;;) {
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return normalizeCase(resolved);
+    }
+    segments.unshift(path.basename(current));
+    current = parent;
+    try {
+      const realParent = await realpath(current);
+      return normalizeCase(path.join(realParent, ...segments));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw err;
+      }
+    }
+  }
+}
+
+export async function assertDifferentPaths(left: string, right: string): Promise<void> {
+  const [canonicalLeft, canonicalRight] = await Promise.all([
+    canonicalizePath(left),
+    canonicalizePath(right),
+  ]);
+  if (canonicalLeft === canonicalRight) {
     throw new Error("backup and live cursor paths must be different");
   }
 }
@@ -155,14 +193,14 @@ async function main(): Promise<void> {
     const backupFile = resolvePath(
       options.out ?? `${cursorFile}.${new Date().toISOString().replace(/[:.]/g, "-")}.bak`,
     );
-    assertDifferentPaths(cursorFile, backupFile);
+    await assertDifferentPaths(cursorFile, backupFile);
     await backupCursor({ cursorFile, backupFile, force: options.force });
     return;
   }
 
   if (!options.from) throw new Error("restore requires --from PATH");
   const backupFile = resolvePath(options.from);
-  assertDifferentPaths(cursorFile, backupFile);
+  await assertDifferentPaths(cursorFile, backupFile);
   const lockFile = resolvePath(process.env.INSTANCE_LOCK_FILE ?? "./data/poller.lock");
   await restoreCursor({
     cursorFile,

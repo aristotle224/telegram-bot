@@ -269,6 +269,9 @@ function toEntryView(
     lastError:
       entry.lastError === null ? null : sanitizeDlqText(entry.lastError, chatIds, secrets),
     chatId: entryChat,
+    ...(entry.networkPassphrase !== undefined
+      ? { networkPassphrase: sanitizeDlqText(entry.networkPassphrase, chatIds, secrets) }
+      : {}),
   };
 }
 
@@ -522,6 +525,7 @@ function formatListOutput(
       (e) =>
         `  ${e.id}  enqueued=${e.enqueuedAt}  source=${e.source}  ledger=${e.ledger}  ` +
         `event=${e.eventName}  attempts=${e.attempts}  chat=${e.chatId}  ` +
+        (e.networkPassphrase ? `network=${boundText(e.networkPassphrase, 64)}  ` : "") +
         `lastError=${boundText(e.lastError ?? "none", 120)}`,
     ),
   ];
@@ -540,6 +544,7 @@ function formatShowOutput(entry: DlqEntryView, asJson: boolean): string {
     `eventName:  ${entry.eventName}`,
     `attempts:   ${entry.attempts}`,
     `chatId:     ${entry.chatId}`,
+    `network:    ${entry.networkPassphrase ?? "unknown (legacy)"}`,
     `lastError:  ${entry.lastError ?? "none"}`,
     `text:\n${entry.text}`,
   ].join("\n");
