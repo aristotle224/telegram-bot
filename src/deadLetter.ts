@@ -80,6 +80,33 @@ export interface DeadLetterQueueOptions {
 export const DEAD_LETTER_MAX_ENTRIES = 100;
 export const DEAD_LETTER_MAX_ATTEMPTS = 10;
 
+export class DeadLetterMalformedError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "DeadLetterMalformedError";
+  }
+}
+
+export class DeadLetterAccessError extends Error {
+  readonly code?: string;
+
+  constructor(message: string, code?: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "DeadLetterAccessError";
+    this.code = code;
+  }
+}
+
+export interface DeadLetterLoadOptions {
+  /**
+   * When true, surface malformed files and non-ENOENT access errors instead of
+   * falling back to an empty queue. Used by the offline inspection CLI.
+   */
+  strict?: boolean;
+  /** Suppress informational `loaded ...` stdout logging (keeps CLI stdout machine-readable). */
+  quiet?: boolean;
+}
+
 const ERROR_TRUNCATE = 200;
 /** Telegram's own message ceiling (4,096) minus room for the queue's own text. */
 const TEXT_TRUNCATE = 4_000;
@@ -128,7 +155,9 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     stats.depth = entries.length;
   }
 
-  async function load(): Promise<void> {
+  async function load(loadOptions: DeadLetterLoadOptions = {}): Promise<void> {
+    const strict = loadOptions.strict === true;
+    const quiet = loadOptions.quiet === true;
     if (filePath === null) {
       entries = [];
       syncDepth();
@@ -138,7 +167,15 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     let raw: string;
     try {
       raw = await readFile(filePath, "utf8");
-    } catch {
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (strict && code !== "ENOENT") {
+        throw new DeadLetterAccessError(
+          `cannot read dead-letter file ${filePath}: ${safeError(err)}`,
+          code,
+          { cause: err },
+        );
+      }
       // No file yet is the normal first-run case, not a problem to report.
       entries = [];
       syncDepth();
@@ -146,21 +183,41 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
     }
 
     try {
-      const parsed = JSON.parse(raw) as DeadLetterFile;
-      if (parsed.version !== 1 || !Array.isArray(parsed.entries)) {
+      const parsed = JSON.parse(raw) as unknown;
+      if (
+        parsed === null ||
+        typeof parsed !== "object" ||
+        Array.isArray(parsed) ||
+        (parsed as DeadLetterFile).version !== 1 ||
+        !Array.isArray((parsed as DeadLetterFile).entries)
+      ) {
+        if (strict) {
+          throw new DeadLetterMalformedError(
+            `malformed dead-letter file at ${filePath}: expected version 1 with entries array`,
+          );
+        }
         console.warn(
           `[dead-letter] unknown or corrupt queue at ${filePath}; starting empty`,
         );
         entries = [];
       } else {
-        entries = parsed.entries
-          .filter(
-            (e) =>
-              e &&
-              typeof e.id === "string" &&
-              typeof e.text === "string" &&
-              typeof e.ledger === "number",
-          )
+        const rawEntries = (parsed as DeadLetterFile).entries;
+        const validEntry = (e: unknown): e is DeadLetterEntry =>
+          Boolean(
+            e &&
+              typeof e === "object" &&
+              !Array.isArray(e) &&
+              typeof (e as DeadLetterEntry).id === "string" &&
+              typeof (e as DeadLetterEntry).text === "string" &&
+              typeof (e as DeadLetterEntry).ledger === "number",
+          );
+        if (strict && rawEntries.some((e) => !validEntry(e))) {
+          throw new DeadLetterMalformedError(
+            `malformed dead-letter entry in ${filePath}: expected id, text, and ledger`,
+          );
+        }
+        entries = rawEntries
+          .filter(validEntry)
           .map((e) => ({
             id: e.id,
             enqueuedAt:
@@ -179,13 +236,20 @@ export function createDeadLetterQueue(options: DeadLetterQueueOptions) {
         }
       }
     } catch (err) {
+      if (strict) {
+        if (err instanceof DeadLetterMalformedError) throw err;
+        throw new DeadLetterMalformedError(
+          `malformed dead-letter file at ${filePath}: ${safeError(err)}`,
+          { cause: err },
+        );
+      }
       console.warn(
         `[dead-letter] unreadable queue at ${filePath}, starting empty: ${safeError(err)}`,
       );
       entries = [];
     }
     syncDepth();
-    if (entries.length > 0) {
+    if (!quiet && entries.length > 0) {
       console.log(`[dead-letter] loaded ${entries.length} parked send(s) from ${filePath}`);
     }
   }

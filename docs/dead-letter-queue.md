@@ -96,6 +96,30 @@ The queue is strictly bounded across every dimension:
 
 ---
 
+## Offline Inspection CLI (`src/dlq-cli.ts`)
+
+Operators can inspect and purge `DEAD_LETTER_FILE` offline without contacting Stellar or Telegram:
+
+```bash
+node dist/dlq-cli.js list [--file PATH] [--json]
+node dist/dlq-cli.js show <id> [--file PATH] [--json]
+node dist/dlq-cli.js purge [--older-than <dur>] [--yes] [--file PATH] [--json]
+```
+
+Diagnostics and errors are written to `stderr`, keeping `stdout` clean and machine-readable (for example, valid JSON when `--json` is passed).
+
+### Exit Codes
+
+| Exit Code | Meaning |
+|---|---|
+| `0` | Success (including `list` when `DEAD_LETTER_FILE` does not exist yet) |
+| `1` | Unknown entry (`show <id>` did not match any entry) |
+| `2` | Invalid CLI arguments or usage |
+| `3` | Malformed dead-letter file (invalid JSON, unsupported version, or invalid entry schema) |
+| `4` | Dead-letter file access or I/O failure (e.g. permission denied or directory path) |
+
+---
+
 ## Operator Inspection with `jq`
 
 Because the file contains standard JSON, operators can safely inspect queue status and contents on host or container storage using `jq`.
