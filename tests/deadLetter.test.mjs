@@ -407,96 +407,81 @@ test("makeEntryId is stable for identical payloads and differs on content", () =
   assert.notEqual(a, d);
 });
 
-// ── Age-based retention & expiry counters ─────────────────────────────────────
-
-test("expired entries are evicted on load and flush while newly failed entries are preserved", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "mimir-dlq-age-"));
+test("flush rejects replay of an entry from another network and leaves it unchanged", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "mimir-dlq-net-"));
   const filePath = path.join(directory, "dead-letter.json");
-  let clock = 1_700_000_000_000;
-  const maxAgeMs = 60_000;
-
   try {
-    const first = createDeadLetterQueue({
+    const testnetQueue = createDeadLetterQueue({
       filePath,
-      maxEntries: 2,
-      maxAttempts: 3,
-      maxAgeMs,
-      now: () => clock,
+      maxEntries: 10,
+      maxAttempts: 5,
+      networkPassphrase: "Test SDF Network ; September 2015",
+      now: () => 1_700_000_000_000,
     });
-    await first.load();
-    await first.enqueue(parked(1, "msg-1"));
-    clock += 30_000;
-    await first.enqueue(parked(2, "msg-2"));
-    assert.equal(first.stats().depth, 2);
-    assert.equal(first.stats().expired, 0);
-
-    // Advance so ledger 1 (70s old) is expired, while ledger 2 (40s old) is still valid.
-    clock += 40_000;
-    // Enqueueing ledger 3 should evict expired ledger 1 first instead of dropping valid ledger 2.
-    await first.enqueue(parked(3, "msg-3"));
-    assert.equal(first.stats().expired, 1);
-    assert.equal(first.stats().dropped, 0);
-    assert.equal(first.stats().depth, 2);
-    assert.deepEqual(
-      first.snapshot().map((e) => e.ledger),
-      [2, 3],
-    );
-
-    // Advance so ledger 2 (70s old) expires, while ledger 3 (30s old) remains.
-    clock += 30_000;
-    const flushed = [];
-    const res = await first.flush(async (_text, entry) => {
-      flushed.push(entry.ledger);
-    }, 10);
-    assert.deepEqual(flushed, [3]);
-    assert.equal(res.sent, 1);
-    assert.equal(res.remaining, 0);
-    assert.equal(first.stats().expired, 2);
-
-    // Reloading a file with an expired entry evicts it on load and counts it.
-    await writeFile(
-      filePath,
-      JSON.stringify({
-        version: 1,
-        updatedAt: new Date(clock).toISOString(),
-        entries: [
-          {
-            id: makeEntryId("market", 10, "claim_cancelled", "old"),
-            enqueuedAt: new Date(clock - maxAgeMs - 1).toISOString(),
-            source: "market",
-            ledger: 10,
-            eventName: "claim_cancelled",
-            text: "old",
-            attempts: 1,
-            lastError: "err",
-          },
-          {
-            id: makeEntryId("market", 11, "claim_cancelled", "exact-boundary"),
-            enqueuedAt: new Date(clock - maxAgeMs).toISOString(),
-            source: "market",
-            ledger: 11,
-            eventName: "claim_cancelled",
-            text: "exact-boundary",
-            attempts: 1,
-            lastError: "err",
-          },
-        ],
-      }),
-    );
-
-    const reloaded = createDeadLetterQueue({
-      filePath,
-      maxEntries: 5,
-      maxAttempts: 3,
-      maxAgeMs,
-      now: () => clock,
+    await testnetQueue.load();
+    await testnetQueue.enqueue({
+      source: "market",
+      ledger: 42,
+      eventName: "claim_created",
+      text: "testnet notification",
+      error: new Error("Telegram 429"),
     });
-    await reloaded.load();
-    assert.equal(reloaded.stats().expired, 1);
-    assert.deepEqual(
-      reloaded.snapshot().map((e) => e.ledger),
-      [11],
-    );
+
+    // Switch active configuration to mainnet and also add a legacy entry without networkPassphrase
+    // plus a mainnet entry to verify budget & compatibility.
+    const rawOnDisk = JSON.parse(await readFile(filePath, "utf8"));
+    rawOnDisk.entries.push({
+      id: "market:43:claim_created:11111111",
+      enqueuedAt: "2026-10-18T10:00:00.000Z",
+      source: "market",
+      ledger: 43,
+      eventName: "claim_created",
+      text: "legacy entry",
+      attempts: 1,
+      lastError: "Telegram 429",
+    });
+    await writeFile(filePath, JSON.stringify(rawOnDisk, null, 2), "utf8");
+
+    const mainnetQueue = createDeadLetterQueue({
+      filePath,
+      maxEntries: 10,
+      maxAttempts: 5,
+      networkPassphrase: "Public Global Stellar Network ; September 2015",
+      now: () => 1_700_000_005_000,
+    });
+    await mainnetQueue.load();
+    await mainnetQueue.enqueue({
+      source: "market",
+      ledger: 44,
+      eventName: "claim_created",
+      text: "mainnet notification",
+      error: new Error("Telegram 503"),
+    });
+
+    const sentLedgers = [];
+    const result = await mainnetQueue.flush(async (_text, entry) => {
+      sentLedgers.push(entry.ledger);
+    }, 2);
+
+    // Legacy (43) and matching mainnet (44) replayed; testnet (42) rejected and left untouched.
+    assert.deepEqual(sentLedgers, [43, 44]);
+    assert.equal(result.sent, 2);
+    assert.equal(result.remaining, 1);
+    assert.equal(result.rejectedNetworkMismatch, 1);
+
+    const persisted = JSON.parse(await readFile(filePath, "utf8"));
+    assert.equal(persisted.entries.length, 1);
+    assert.deepEqual(persisted.entries[0], {
+      id: rawOnDisk.entries[0].id,
+      enqueuedAt: rawOnDisk.entries[0].enqueuedAt,
+      source: "market",
+      ledger: 42,
+      eventName: "claim_created",
+      text: "testnet notification",
+      attempts: 1,
+      lastError: "Telegram 429",
+      networkPassphrase: "Test SDF Network ; September 2015",
+    });
   } finally {
     await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }

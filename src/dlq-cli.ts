@@ -16,7 +16,14 @@
  *   - Secrets are scrubbed via `safeErrorMessage` / `redactText`.
  *   - `purge` without `--yes` performs a dry run and never modifies disk.
  *   - `purge --yes` writes atomically via the queue's persistence functions.
- *   - Unknown subcommands or bad arguments print usage and exit 2.
+ *   - Stdout stays machine-readable: errors and diagnostics go to stderr.
+ *
+ * Exit codes:
+ *   - 0: success
+ *   - 1: unknown dead-letter entry (`show <id>` not found)
+ *   - 2: invalid CLI arguments or usage
+ *   - 3: malformed dead-letter file (invalid JSON or schema)
+ *   - 4: dead-letter file access or I/O failure
  */
 
 import path from "node:path";
@@ -27,20 +34,39 @@ import {
   createDeadLetterQueue,
   DEAD_LETTER_MAX_ATTEMPTS,
   DEAD_LETTER_MAX_ENTRIES,
+  DeadLetterAccessError,
+  DeadLetterMalformedError,
   type DeadLetterEntry,
 } from "./deadLetter.js";
 import { redactText } from "./redact.js";
 import { boundText, redactChatId } from "./status.js";
 
+export const DLQ_EXIT_CODES = {
+  OK: 0,
+  NOT_FOUND: 1,
+  USAGE: 2,
+  MALFORMED_FILE: 3,
+  ACCESS_ERROR: 4,
+} as const;
+
 export const USAGE =
   "usage: npm run dlq -- <list|show <id>|purge [--older-than <dur>] [--yes]> [--file PATH] [--json]";
 
 export class DlqUsageError extends Error {
-  readonly exitCode = 2;
+  readonly exitCode = DLQ_EXIT_CODES.USAGE;
 
   constructor(message: string) {
     super(message.includes(USAGE) ? message : `${message}\n${USAGE}`);
     this.name = "DlqUsageError";
+  }
+}
+
+export class DlqNotFoundError extends Error {
+  readonly exitCode = DLQ_EXIT_CODES.NOT_FOUND;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "DlqNotFoundError";
   }
 }
 
@@ -244,6 +270,9 @@ function toEntryView(
     lastError:
       entry.lastError === null ? null : sanitizeDlqText(entry.lastError, chatIds, secrets),
     chatId: entryChat,
+    ...(entry.networkPassphrase !== undefined
+      ? { networkPassphrase: sanitizeDlqText(entry.networkPassphrase, chatIds, secrets) }
+      : {}),
   };
 }
 
@@ -290,9 +319,8 @@ export async function inspectDeadLetters(options: ListDlqOptions): Promise<{
   expired: number;
 }> {
   const queue = openQueue(options);
-  await queue.load();
-  const entries = queue.snapshot().map((entry) => toEntryView(entry, options));
-  return { entries, expired: queue.stats().expired };
+  await queue.load({ strict: true, quiet: true });
+  return queue.snapshot().map((entry) => toEntryView(entry, options));
 }
 
 /** Load and return a single dead-letter entry by id, or throw if not found. */
@@ -302,10 +330,10 @@ export async function showDeadLetter(options: ShowDlqOptions): Promise<DlqEntryV
     throw new DlqUsageError(`show requires an entry <id>\n${USAGE}`);
   }
   const queue = openQueue(options);
-  await queue.load();
+  await queue.load({ strict: true, quiet: true });
   const match = queue.snapshot().find((entry) => entry.id === targetId);
   if (!match) {
-    throw new Error(`dead-letter entry not found: ${boundText(targetId, 120)}`);
+    throw new DlqNotFoundError(`dead-letter entry not found: ${boundText(targetId, 120)}`);
   }
   return toEntryView(match, options);
 }
@@ -338,7 +366,7 @@ export async function purgeDeadLetters(options: PurgeDlqOptions): Promise<PurgeD
   const dryRun = options.yes !== true;
 
   const queue = openQueue(options);
-  await queue.load();
+  await queue.load({ strict: true, quiet: true });
   const before = queue.snapshot();
   const matched = before.filter((entry) => shouldPurgeEntry(entry, cutoffMs));
   const purgedIds = matched.map((entry) => entry.id);
@@ -394,7 +422,7 @@ async function persistPurgedQueue(
     now: options.now,
   });
 
-  await queue.load();
+  await queue.load({ strict: true, quiet: true });
   const current = queue.snapshot();
   if (current.length === 0) {
     return;
@@ -519,6 +547,7 @@ function formatListOutput(
       (e) =>
         `  ${e.id}  enqueued=${e.enqueuedAt}  source=${e.source}  ledger=${e.ledger}  ` +
         `event=${e.eventName}  attempts=${e.attempts}  chat=${e.chatId}  ` +
+        (e.networkPassphrase ? `network=${boundText(e.networkPassphrase, 64)}  ` : "") +
         `lastError=${boundText(e.lastError ?? "none", 120)}`,
     ),
   ];
@@ -537,6 +566,7 @@ function formatShowOutput(entry: DlqEntryView, asJson: boolean): string {
     `eventName:  ${entry.eventName}`,
     `attempts:   ${entry.attempts}`,
     `chatId:     ${entry.chatId}`,
+    `network:    ${entry.networkPassphrase ?? "unknown (legacy)"}`,
     `lastError:  ${entry.lastError ?? "none"}`,
     `text:\n${entry.text}`,
   ].join("\n");
@@ -618,11 +648,23 @@ export async function runDlqCli(
   } catch (err) {
     if (err instanceof DlqUsageError) {
       errOut(`[dlq] ${err.message}`);
-      return { exitCode: 2 };
+      return { exitCode: DLQ_EXIT_CODES.USAGE };
+    }
+    if (err instanceof DlqNotFoundError) {
+      errOut(`[dlq] ${boundText(err.message, 300)}`);
+      return { exitCode: DLQ_EXIT_CODES.NOT_FOUND };
+    }
+    if (err instanceof DeadLetterMalformedError) {
+      errOut(`[dlq] ${boundText(err.message, 300)}`);
+      return { exitCode: DLQ_EXIT_CODES.MALFORMED_FILE };
+    }
+    if (err instanceof DeadLetterAccessError) {
+      errOut(`[dlq] ${boundText(err.message, 300)}`);
+      return { exitCode: DLQ_EXIT_CODES.ACCESS_ERROR };
     }
     const message = err instanceof Error ? err.message : "dlq command failed";
     errOut(`[dlq] ${boundText(message, 300)}`);
-    return { exitCode: 1 };
+    return { exitCode: DLQ_EXIT_CODES.ACCESS_ERROR };
   }
 }
 
