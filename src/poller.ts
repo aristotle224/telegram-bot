@@ -82,8 +82,11 @@ import {
 } from "./deadLetter.js";
 import {
   createSendJournal,
+  type OrphanDecision,
+  type OrphanedJournalEntry,
   type SendJournal,
 } from "./notifications/send-journal.js";
+import { resolveRouteChatId } from "./notifications/notifier.js";
 import {
   acquireInstanceLock,
   InstanceLockError,
@@ -419,6 +422,8 @@ export interface CursorFile {
    * it, so the on-disk format stays version 1 either way.
    */
   chainClockAt?: number | null;
+  /** Optional network identifier for backup ownership validation. */
+  network?: string;
   targets: Record<string, CursorTarget>;
   /**
    * Bounded history of cursor recovery actions (floor rewinds, operator
@@ -432,6 +437,8 @@ export interface CursorFile {
 interface CursorTarget {
   cursor: string | null;
   lastEventLedger: number | null;
+  /** Optional contract identifier for backup ownership validation. */
+  contractId?: string;
   /**
    * Recently processed event ids, oldest first. Additive and bounded: older
    * cursor files without it load as an empty window, and new files stay small
@@ -739,6 +746,14 @@ export interface PollerDeps {
   targetBackoffOptions?: TargetBackoffOptions;
   /** Circuit breaker configuration */
   circuitBreakerOptions?: CircuitBreakerOptions;
+  /**
+   * Explicit recovery policy for orphaned send-journal entries whose route was
+   * removed or whose network identity changed. When omitted, orphaned entries
+   * are skipped (never silently replayed).
+   */
+  onOrphanedJournalEntry?: (
+    orphan: OrphanedJournalEntry,
+  ) => OrphanDecision | Promise<OrphanDecision>;
   /**
    * Tuning for the rolling activity baseline. Defaults are production values;
    * tests can shrink the window to observe a comparison quickly.
@@ -1191,6 +1206,7 @@ function normalizeTargetEntry(value: unknown, label: string): CursorTargetEntry 
   return {
     cursor,
     lastEventLedger,
+    ...(contractId !== undefined ? { contractId } : {}),
     ...(Array.isArray(recent)
       ? { recentEventIds: recent.filter((id): id is string => typeof id === "string") }
       : {}),
@@ -1298,6 +1314,51 @@ export function parseAndMigrateCursorFile(
   }
 
   throw new Error("cursor file: unrecognised shape (expected versioned targets map)");
+}
+
+/** Compute a stable SHA-256 hex digest of raw cursor file contents for CAS checks. */
+export function cursorDigest(raw: string): string {
+  return createHash("sha256").update(raw, "utf8").digest("hex");
+}
+
+export type CursorCasResult =
+  | { ok: true; digest: string | null }
+  | {
+      ok: false;
+      conflict: true;
+      expected: string | null;
+      actual: string | null;
+      reason: string;
+    };
+
+/**
+ * Compare-and-swap check for a cursor file against an expected SHA-256 digest
+ * (or `null` when the file is expected to be absent). When `expectedDigest` is
+ * `undefined`, no CAS precondition was requested and the check succeeds.
+ */
+export function checkCursorCas(
+  currentRaw: string | null,
+  expectedDigest: string | null | undefined,
+): CursorCasResult {
+  const actual = currentRaw === null ? null : cursorDigest(currentRaw);
+  if (expectedDigest === undefined) {
+    return { ok: true, digest: actual };
+  }
+  if (actual !== expectedDigest) {
+    return {
+      ok: false,
+      conflict: true,
+      expected: expectedDigest,
+      actual,
+      reason:
+        expectedDigest === null
+          ? "file exists on disk (expected absent)"
+          : actual === null
+            ? "file is missing on disk (expected existing content)"
+            : `digest mismatch (expected ${expectedDigest.slice(0, 12)}…, got ${actual.slice(0, 12)}…)`,
+    };
+  }
+  return { ok: true, digest: actual };
 }
 
 /** Build the on-disk payload the poller always writes. */
@@ -1589,8 +1650,8 @@ async function sendWithRetry(
     } catch (err) {
       attempt++;
       const retryAfterMs = extractRetryAfterMs(err);
-      if (attempt >= maxRetries || !shouldRetry()) {
-        throw err; // Exhausted retries, or a shutdown made waiting pointless
+      if (attempt >= maxRetries || !shouldRetry() || isForumTopicClosed(err)) {
+        throw err; // Exhausted retries, shutdown in progress, or a permanent route failure
       }
 
       const delay = retryAfterMs !== null ? retryAfterMs : backoff;
@@ -1790,6 +1851,7 @@ export function createPoller(deps: PollerDeps) {
     sendJournal = createSendJournal({
       filePath: config.sendJournalFile,
       now,
+      secrets: config.botToken ? [config.botToken] : [],
     });
   }
 
@@ -2578,6 +2640,8 @@ export function createPoller(deps: PollerDeps) {
             ledger: event.ledger,
             eventName: event.payload.name,
             textHash,
+            chatId: resolveRouteChatId(config, event.source),
+            networkPassphrase: config.networkPassphrase,
             at: now(),
           });
         } catch (err) {
@@ -2619,6 +2683,22 @@ export function createPoller(deps: PollerDeps) {
         // All retries exhausted. The event still counts as failed and the cursor
         // still advances — but the message is parked instead of dropped, so a
         // transient Telegram outage costs a delay rather than the notification.
+        if (sendJournal) {
+          try {
+            await sendJournal.recordError({
+              id: event.eventId,
+              source: event.source,
+              ledger: event.ledger,
+              eventName: event.payload.name,
+              error: err,
+              secrets: config.botToken ? [config.botToken] : [],
+            });
+          } catch (journalErr) {
+            console.error(
+              `[poller] send journal error record failed for ${event.eventId}: ${safeErrorMessage(journalErr)}`,
+            );
+          }
+        }
         recordFailedIncrement();
         metrics?.notificationsFailed.inc();
         failed += 1;
@@ -2636,7 +2716,18 @@ export function createPoller(deps: PollerDeps) {
             `${chat ? ` to chat ${chat}` : ""} after retries: ` +
             `${errorMessage(err)} correlation=${correlationId}`,
         );
-        if (deadLetterEnabled) {
+        if (isForumTopicClosed(err)) {
+          // Permanent route failure: the topic is closed or deleted. Retrying
+          // will produce the same 400, so the message is not parked in the DLQ.
+          // The cursor still advances and the failure is counted above. The
+          // operator must re-open the topic (or update the route) to restore
+          // delivery; unrelated topic routes remain operational.
+          console.error(
+            `[poller] permanent route failure for ${event.payload.name} at ledger ${event.ledger}` +
+              `${chat ? ` to chat ${chat}` : ""}: forum topic is closed or not found — ` +
+              `not queuing for retry (update the route to restore delivery)`,
+          );
+        } else if (deadLetterEnabled) {
           await deadLetter.enqueue({
             source: event.source,
             ledger: event.ledger,
@@ -3420,8 +3511,37 @@ export function createPoller(deps: PollerDeps) {
       // the cursor commit. Treat them as committed so a restart never duplicates
       // them (the existing lossy cursor-commit policy).
       if (sendJournal) {
-        for (const entry of await sendJournal.loadPending()) {
+        const recoveryContext = {
+          resolveRouteChatId: (s: string) =>
+            resolveRouteChatId(config, s === "market" || s === "squad" ? s : undefined),
+          networkPassphrase: config.networkPassphrase,
+        };
+        const { valid, orphaned } = await sendJournal.classifyPending(recoveryContext);
+        for (const entry of valid) {
           maybeSent.add(entry.id);
+        }
+        if (orphaned.length > 0) {
+          if (deps.onOrphanedJournalEntry) {
+            const recovered = await sendJournal.recoverOrphans(
+              recoveryContext,
+              deps.onOrphanedJournalEntry,
+            );
+            for (const entry of recovered.reroutedEntries) {
+              maybeSent.add(entry.id);
+            }
+            Logger.warn(
+              "poller",
+              `recovered ${orphaned.length} orphaned send-journal entries ` +
+                `(discarded=${recovered.discarded}, rerouted=${recovered.rerouted})`,
+            );
+          } else {
+            Logger.warn(
+              "poller",
+              `skipped ${orphaned.length} orphaned send-journal entr${orphaned.length === 1 ? "y" : "ies"} ` +
+                `(requires explicit discard or reroute decision): ` +
+                orphaned.map((o) => `${o.entry.id}:${o.reason}`).join(", "),
+            );
+          }
         }
         await sendJournal.compact();
       }
